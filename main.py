@@ -1,9 +1,9 @@
 from terminal_typer.app import TerminalTyperApp
-from terminal_typer.constants import PROMPT_TEXT
+from terminal_typer.prompts import generate_prompt, generate_timed_line
 
 
 def main() -> None:
-    app = TerminalTyperApp(PROMPT_TEXT)
+    app = TerminalTyperApp(generate_prompt, generate_timed_line)
     app.run()
 
 

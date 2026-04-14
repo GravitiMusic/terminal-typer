@@ -1,5 +1,11 @@
-PROMPT_TEXT = "The quick brown fox jumps over the lazy dog."
 APP_NAME = "TerminalTyper"
+DEFAULT_WORDS_PER_TEST = 30
+DEFAULT_TIMED_SECONDS = 30
+TIMED_LINE_WORDS = 15
+TIMED_VISIBLE_LINES = 3
+WORD_COUNT_OPTIONS = (30, 60, 90, 120)
+TIMED_SECONDS_OPTIONS = (30, 60, 90, 120)
+TITLE_MENU_OPTIONS = ("Start word-count test", "Start timed test", "Settings")
 
 LOGO_PALETTE = (
     "#f9c74f",
@@ -28,9 +34,15 @@ Screen {
 #card {
     width: 88;
     max-width: 95%;
+    height: 90%;
     border: tall #2e3b47;
     padding: 1 2;
     background: #141b22;
+}
+
+#content_scroller {
+    height: 1fr;
+    overflow-y: auto;
 }
 
 #title {
