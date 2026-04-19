@@ -8,7 +8,7 @@ Current release: `0.1.0`.
 
 ## Release Notes
 
-See [CHANGELOG.md](CHANGELOG.md) for the release history and [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) for the publish workflow.
+See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
 ## License
 

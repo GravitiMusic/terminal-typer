@@ -71,7 +71,7 @@ uv build
 
 This project is now set up to package its bundled language files with the Python distribution, so installed builds no longer depend on the original repository layout.
 
-For a release summary, see [CHANGELOG.md](../CHANGELOG.md). For the release workflow, see [RELEASE_CHECKLIST.md](../RELEASE_CHECKLIST.md).
+For a release summary, see [CHANGELOG.md](../CHANGELOG.md).
 
 ## License
 
