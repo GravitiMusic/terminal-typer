@@ -1,11 +1,12 @@
 APP_NAME = "TerminalTyper"
 DEFAULT_WORDS_PER_TEST = 30
 DEFAULT_TIMED_SECONDS = 30
-TIMED_LINE_WORDS = 15
+DEFAULT_WORD_LIST_NAME = "english_5k.json"
+TIMED_FALLBACK_LINE_WIDTH = 48
 TIMED_VISIBLE_LINES = 3
 WORD_COUNT_OPTIONS = (30, 60, 90, 120)
 TIMED_SECONDS_OPTIONS = (30, 60, 90, 120)
-TITLE_MENU_OPTIONS = ("Start word-count test", "Start timed test", "Settings")
+TITLE_MENU_OPTIONS = ("Start word-count test", "Start timed test", "History", "Settings")
 
 LOGO_PALETTE = (
     "#f9c74f",

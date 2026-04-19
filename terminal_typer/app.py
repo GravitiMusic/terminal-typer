@@ -3,38 +3,44 @@ from collections.abc import Callable
 
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, VerticalScroll
-from textual.events import Key
+from textual.events import Key, Resize
 from textual.widgets import Footer, Static
 
 from .constants import (
     APP_CSS,
     MENU_OPTIONS,
-    TIMED_LINE_WORDS,
+    TIMED_FALLBACK_LINE_WIDTH,
     TIMED_SECONDS_OPTIONS,
     TIMED_VISIBLE_LINES,
     TITLE_MENU_OPTIONS,
     WORD_COUNT_OPTIONS,
 )
+from .history import filter_run_history, load_run_history, record_run, summarize_run_history
 from .metrics import TypingResults, calculate_results
+from .personal_bests import get_personal_best, record_personal_best
 from .renderers import (
+    render_history_screen,
     render_intro_logo,
+    render_page_help,
+    render_page_title,
     render_progress,
     render_results,
     render_settings_menu,
     render_timed_progress,
     render_title_menu,
 )
+from .prompts import list_word_list_options
 from .settings import UserSettings, load_settings, save_settings
 
 
 class TerminalTyperApp(App):
     CSS = APP_CSS
-    BINDINGS = [("escape", "quit", "Quit")]
+    BINDINGS = [("escape", "quit", "Quit app"), ("shift+escape", "quit_test", "Quit test")]
 
     def __init__(
         self,
-        word_prompt_provider: Callable[[int], str],
-        timed_line_provider: Callable[[int], str],
+        word_prompt_provider: Callable[[int, str], str],
+        timed_line_provider: Callable[[int, str], str],
     ) -> None:
         super().__init__()
         self.word_prompt_provider = word_prompt_provider
@@ -48,6 +54,8 @@ class TerminalTyperApp(App):
         self.timed_deadline: float | None = None
         self.timed_refresh_timer = None
         self.timed_lines: list[str] = []
+        self.timed_line_word_counts: list[int] = []
+        self.timed_word_buffer: list[str] = []
         self.timed_line_chars: list[str] = []
         self.mode = "intro"
         self.intro_frame = 0
@@ -56,12 +64,36 @@ class TerminalTyperApp(App):
         self.title_menu_index = 0
         self.word_count_options = list(WORD_COUNT_OPTIONS)
         self.timed_seconds_options = list(TIMED_SECONDS_OPTIONS)
+        self.word_list_options = list(list_word_list_options())
+        if self.settings.word_list_name not in self.word_list_options:
+            self.settings.word_list_name = self.word_list_options[0]
         self.word_count_index = self.word_count_options.index(self.settings.word_count)
         self.timed_seconds_index = self.timed_seconds_options.index(self.settings.timed_seconds)
+        self.word_list_index = self.word_list_options.index(self.settings.word_list_name)
         self.settings_row_index = 0
         self.menu_options = list(MENU_OPTIONS)
         self.menu_index = 0
         self.result: TypingResults | None = None
+        self.current_personal_best_wpm: float | None = None
+        self.is_new_personal_best = False
+        self.best_update_eligible = True
+        self.history_records: list[dict] = []
+        self.history_mode_options = ["all", "words", "timed"]
+        self.history_setting_options: list[tuple[str, tuple[str, int] | None]] = [("all settings", None)]
+        self.history_setting_options.extend(
+            (f"{word_count} words", ("words", word_count))
+            for word_count in self.word_count_options
+        )
+        self.history_setting_options.extend(
+            (f"{timed_seconds} seconds", ("timed", timed_seconds))
+            for timed_seconds in self.timed_seconds_options
+        )
+        self.history_word_list_options = ["all", *self.word_list_options]
+        self.history_filter_row_index = 0
+        self.history_mode_index = 0
+        self.history_setting_index = 0
+        self.history_word_list_index = 0
+        self.run_recorded = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="root"):
@@ -80,16 +112,38 @@ class TerminalTyperApp(App):
         self._show_intro()
         self.intro_timer = self.set_interval(0.12, self._animate_intro)
 
+    def on_resize(self, event: Resize) -> None:
+        del event
+        if self.mode == "typing" and self.test_mode == "timed":
+            self._reflow_timed_lines()
+            self._refresh_target()
+
     def on_key(self, event: Key) -> None:
         if self.mode == "intro":
+            if event.key in ("up", "down", "left", "right", "enter"):
+                event.stop()
+                event.prevent_default()
             self._handle_intro_keys(event.key)
             return
 
         if self.mode == "settings":
+            if event.key in ("up", "down", "left", "right", "enter"):
+                event.stop()
+                event.prevent_default()
             self._handle_settings_keys(event.key)
             return
 
+        if self.mode == "history":
+            if event.key in ("up", "down", "left", "right", "enter"):
+                event.stop()
+                event.prevent_default()
+            self._handle_history_keys(event.key)
+            return
+
         if self.mode == "results":
+            if event.key in ("up", "down", "left", "right", "enter"):
+                event.stop()
+                event.prevent_default()
             self._handle_results_keys(event.key)
             return
 
@@ -102,6 +156,10 @@ class TerminalTyperApp(App):
 
         key_name = event.key
         character = event.character
+
+        if key_name in ("up", "down", "left", "right", "enter", "backspace"):
+            event.stop()
+            event.prevent_default()
 
         if key_name == "enter":
             if self.test_mode == "timed":
@@ -157,6 +215,8 @@ class TerminalTyperApp(App):
                 self.title_menu_index,
                 self.settings.word_count,
                 self.settings.timed_seconds,
+                self._get_word_count_personal_best(),
+                self._get_timed_personal_best(),
             )
         )
 
@@ -167,11 +227,17 @@ class TerminalTyperApp(App):
 
     def _start_word_count_test(self) -> None:
         self.test_mode = "words"
-        prompt_text = self.word_prompt_provider(self.settings.word_count)
+        self.timed_word_buffer = []
+        self.timed_line_word_counts = []
+        self.timed_line_chars = []
+        prompt_text = self.word_prompt_provider(self.settings.word_count, self.settings.word_list_name)
         self._start_typing_test(prompt_text)
 
     def _start_timed_test(self) -> None:
         self.test_mode = "timed"
+        self.timed_word_buffer = []
+        self.timed_line_word_counts = []
+        self.timed_line_chars = []
         prompt_text = self._build_initial_timed_prompt()
         self._start_typing_test(prompt_text)
         self._update_timed_status_if_needed()
@@ -184,11 +250,11 @@ class TerminalTyperApp(App):
         self.query_one("#content_scroller", VerticalScroll).scroll_home(animate=False)
         self.prompt_text = prompt_text
         self.chars = []
-        self.timed_line_chars = []
         self.start_time = None
         self.end_time = None
         self.result = None
         self.timed_deadline = None
+        self.run_recorded = False
         self._stop_timed_refresh_timer()
 
         if self.intro_timer is not None:
@@ -203,9 +269,9 @@ class TerminalTyperApp(App):
         self.query_one("#title", Static).update("Type this text")
         self.query_one("#help", Static).display = True
         if self.test_mode == "timed":
-            self.query_one("#help", Static).update("Type until the timer ends. Backspace to correct.")
+            self.query_one("#help", Static).update("Type until the timer ends. Backspace to correct. Press Shift+Esc to quit test.")
         else:
-            self.query_one("#help", Static).update("Type to begin. Enter to finish. Backspace to correct.")
+            self.query_one("#help", Static).update("Type to begin. Enter to finish. Backspace to correct. Press Shift+Esc to quit test.")
         self.query_one("#target", Static).display = True
         self.query_one("#summary", Static).display = True
         if self.test_mode == "timed":
@@ -219,24 +285,51 @@ class TerminalTyperApp(App):
         self.query_one("#content_scroller", VerticalScroll).scroll_home(animate=False)
         self.word_count_index = self.word_count_options.index(self.settings.word_count)
         self.timed_seconds_index = self.timed_seconds_options.index(self.settings.timed_seconds)
+        self.word_list_index = self.word_list_options.index(self.settings.word_list_name)
         self.settings_row_index = 0
-        self.query_one("#intro_welcome", Static).display = True
-        self.query_one("#intro_logo", Static).display = True
-        self.query_one("#intro_prompt", Static).display = True
+        self.query_one("#intro_welcome", Static).display = False
+        self.query_one("#intro_logo", Static).display = False
+        self.query_one("#intro_prompt", Static).display = False
 
         self.query_one("#title", Static).display = True
-        self.query_one("#title", Static).update("Settings")
+        self.query_one("#title", Static).update(render_page_title("Settings", "#f9c74f"))
         self.query_one("#help", Static).display = True
-        self.query_one("#help", Static).update("Configure your test defaults.")
+        self.query_one("#help", Static).update(
+            render_page_help("Configure your test defaults.", "#d8c27a")
+        )
         self.query_one("#target", Static).display = False
         self.query_one("#summary", Static).display = True
         self.query_one("#summary", Static).update(
             render_settings_menu(
                 self.word_count_options[self.word_count_index],
                 self.timed_seconds_options[self.timed_seconds_index],
+                self.word_list_options[self.word_list_index],
                 self.settings_row_index,
             )
         )
+
+    def _show_history(self) -> None:
+        self.mode = "history"
+        self.query_one("#content_scroller", VerticalScroll).scroll_home(animate=False)
+        self.history_records = load_run_history()
+        self.history_filter_row_index = 0
+        self.history_mode_index = 0
+        self.history_setting_index = 0
+        self.history_word_list_index = 0
+
+        self.query_one("#intro_welcome", Static).display = False
+        self.query_one("#intro_logo", Static).display = False
+        self.query_one("#intro_prompt", Static).display = False
+
+        self.query_one("#title", Static).display = True
+        self.query_one("#title", Static).update(render_page_title("History", "#43aa8b"))
+        self.query_one("#help", Static).display = True
+        self.query_one("#help", Static).update(
+            render_page_help("Review recent runs, filter them, and inspect error trends.", "#8bc7ba")
+        )
+        self.query_one("#target", Static).display = False
+        self.query_one("#summary", Static).display = True
+        self._refresh_history_screen()
 
     def _handle_intro_keys(self, key_name: str) -> None:
         if key_name in ("up", "left"):
@@ -247,6 +340,8 @@ class TerminalTyperApp(App):
                     self.title_menu_index,
                     self.settings.word_count,
                     self.settings.timed_seconds,
+                    self._get_word_count_personal_best(),
+                    self._get_timed_personal_best(),
                 )
             )
             return
@@ -259,6 +354,8 @@ class TerminalTyperApp(App):
                     self.title_menu_index,
                     self.settings.word_count,
                     self.settings.timed_seconds,
+                    self._get_word_count_personal_best(),
+                    self._get_timed_personal_best(),
                 )
             )
             return
@@ -269,17 +366,26 @@ class TerminalTyperApp(App):
                 self._start_word_count_test()
             elif selected == "Start timed test":
                 self._start_timed_test()
+            elif selected == "History":
+                self._show_history()
             else:
                 self._show_settings()
 
+    def action_quit_test(self) -> None:
+        if self.mode != "typing":
+            return
+
+        self._stop_timed_refresh_timer()
+        self._show_intro()
+
     def _handle_settings_keys(self, key_name: str) -> None:
         if key_name == "up":
-            self.settings_row_index = (self.settings_row_index - 1) % 3
+            self.settings_row_index = (self.settings_row_index - 1) % 4
             self._refresh_settings_menu()
             return
 
         if key_name == "down":
-            self.settings_row_index = (self.settings_row_index + 1) % 3
+            self.settings_row_index = (self.settings_row_index + 1) % 4
             self._refresh_settings_menu()
             return
 
@@ -288,6 +394,8 @@ class TerminalTyperApp(App):
                 self.word_count_index = (self.word_count_index - 1) % len(self.word_count_options)
             elif self.settings_row_index == 1:
                 self.timed_seconds_index = (self.timed_seconds_index - 1) % len(self.timed_seconds_options)
+            elif self.settings_row_index == 2:
+                self.word_list_index = (self.word_list_index - 1) % len(self.word_list_options)
             self._refresh_settings_menu()
             return
 
@@ -296,13 +404,16 @@ class TerminalTyperApp(App):
                 self.word_count_index = (self.word_count_index + 1) % len(self.word_count_options)
             elif self.settings_row_index == 1:
                 self.timed_seconds_index = (self.timed_seconds_index + 1) % len(self.timed_seconds_options)
+            elif self.settings_row_index == 2:
+                self.word_list_index = (self.word_list_index + 1) % len(self.word_list_options)
             self._refresh_settings_menu()
             return
 
         if key_name == "enter":
-            if self.settings_row_index == 2:
+            if self.settings_row_index == 3:
                 self.settings.word_count = self.word_count_options[self.word_count_index]
                 self.settings.timed_seconds = self.timed_seconds_options[self.timed_seconds_index]
+                self.settings.word_list_name = self.word_list_options[self.word_list_index]
                 save_settings(self.settings)
                 self._show_intro()
 
@@ -328,6 +439,40 @@ class TerminalTyperApp(App):
                 self.menu_index = 0
                 self._show_intro()
 
+    def _handle_history_keys(self, key_name: str) -> None:
+        if key_name == "up":
+            self.history_filter_row_index = (self.history_filter_row_index - 1) % 4
+            self._refresh_history_screen()
+            return
+
+        if key_name == "down":
+            self.history_filter_row_index = (self.history_filter_row_index + 1) % 4
+            self._refresh_history_screen()
+            return
+
+        if key_name == "left":
+            if self.history_filter_row_index == 0:
+                self.history_mode_index = (self.history_mode_index - 1) % len(self.history_mode_options)
+            elif self.history_filter_row_index == 1:
+                self.history_setting_index = (self.history_setting_index - 1) % len(self.history_setting_options)
+            elif self.history_filter_row_index == 2:
+                self.history_word_list_index = (self.history_word_list_index - 1) % len(self.history_word_list_options)
+            self._refresh_history_screen()
+            return
+
+        if key_name == "right":
+            if self.history_filter_row_index == 0:
+                self.history_mode_index = (self.history_mode_index + 1) % len(self.history_mode_options)
+            elif self.history_filter_row_index == 1:
+                self.history_setting_index = (self.history_setting_index + 1) % len(self.history_setting_options)
+            elif self.history_filter_row_index == 2:
+                self.history_word_list_index = (self.history_word_list_index + 1) % len(self.history_word_list_options)
+            self._refresh_history_screen()
+            return
+
+        if key_name == "enter" and self.history_filter_row_index == 3:
+            self._show_intro()
+
     def _animate_intro(self) -> None:
         if self.mode != "intro":
             return
@@ -350,24 +495,108 @@ class TerminalTyperApp(App):
         self.query_one("#content_scroller", VerticalScroll).scroll_end(animate=False)
 
     def _build_initial_timed_prompt(self) -> str:
-        self.timed_lines = [
-            self.timed_line_provider(TIMED_LINE_WORDS)
-            for _ in range(TIMED_VISIBLE_LINES)
-        ]
-        return " ".join(self.timed_lines)
+        self.timed_word_buffer = []
+        self.timed_line_chars = []
+        self._reflow_timed_lines()
+        return self.prompt_text
 
     def _advance_timed_line(self) -> None:
+        if self.timed_line_word_counts:
+            completed_word_count = self.timed_line_word_counts.pop(0)
+            del self.timed_word_buffer[:completed_word_count]
+
         if self.timed_lines:
             self.timed_lines.pop(0)
-        self.timed_lines.append(self.timed_line_provider(TIMED_LINE_WORDS))
-        self.prompt_text = " ".join(self.timed_lines)
+
+        self._append_timed_words()
+
+        new_line_word_count = len(self.timed_word_buffer) - sum(self.timed_line_word_counts)
+        while len(self.timed_lines) < TIMED_VISIBLE_LINES and new_line_word_count > 0:
+            start_index = sum(self.timed_line_word_counts)
+            next_line_words = self.timed_word_buffer[start_index:]
+            next_line = " ".join(next_line_words)
+            self.timed_lines.append(next_line)
+            self.timed_line_word_counts.append(len(next_line_words))
+            new_line_word_count = 0
+
+        self.prompt_text = " ".join(self.timed_word_buffer)
         self.timed_line_chars = []
+
+    def _timed_line_width_budget(self) -> int:
+        target = self.query_one("#target", Static)
+        visible_width = target.size.width
+        if visible_width <= 1:
+            return TIMED_FALLBACK_LINE_WIDTH
+        # Reserve one character for the inter-line separator space.
+        return max(8, visible_width - 1)
 
     def _active_timed_line_target(self) -> str:
         if not self.timed_lines:
             return ""
         # Preserve a contiguous word stream across visual line boundaries.
-        return f"{self.timed_lines[0]} "
+        has_more_words = bool(self.timed_line_word_counts) and self.timed_line_word_counts[0] < len(self.timed_word_buffer)
+        return f"{self.timed_lines[0]} " if has_more_words else self.timed_lines[0]
+
+    def _append_timed_words(self) -> None:
+        generated_line = self.timed_line_provider(
+            self._timed_line_width_budget(),
+            self.settings.word_list_name,
+        )
+        self.timed_word_buffer.extend(generated_line.split())
+
+    def _wrap_timed_word_buffer(self) -> tuple[list[str], list[int]]:
+        line_width_budget = self._timed_line_width_budget()
+        lines: list[str] = []
+        word_counts: list[int] = []
+        index = 0
+
+        while index < len(self.timed_word_buffer) and len(lines) < TIMED_VISIBLE_LINES:
+            line_words: list[str] = []
+            current_width = 0
+
+            while index < len(self.timed_word_buffer):
+                word = self.timed_word_buffer[index]
+                additional_width = len(word) if not line_words else len(word) + 1
+                if line_words and current_width + additional_width > line_width_budget:
+                    break
+
+                line_words.append(word)
+                current_width += additional_width
+                index += 1
+
+                if current_width >= line_width_budget:
+                    break
+
+            if not line_words:
+                line_words.append(self.timed_word_buffer[index])
+                index += 1
+
+            lines.append(" ".join(line_words))
+            word_counts.append(len(line_words))
+
+        return lines, word_counts
+
+    def _reflow_timed_lines(self) -> None:
+        typed_stream = "".join(self.timed_line_chars)
+
+        while True:
+            while True:
+                lines, word_counts = self._wrap_timed_word_buffer()
+                if len(lines) >= TIMED_VISIBLE_LINES:
+                    break
+                self._append_timed_words()
+
+            self.timed_lines = lines
+            self.timed_line_word_counts = word_counts
+            self.prompt_text = " ".join(self.timed_word_buffer)
+
+            active_target = self._active_timed_line_target()
+            if not active_target or len(typed_stream) <= len(active_target):
+                self.timed_line_chars = list(typed_stream)
+                return
+
+            del self.timed_word_buffer[: self.timed_line_word_counts[0]]
+            typed_stream = typed_stream[len(active_target) :]
 
     def _handle_timed_character(self, character: str) -> None:
         self.chars.append(character)
@@ -385,9 +614,51 @@ class TerminalTyperApp(App):
             render_settings_menu(
                 self.word_count_options[self.word_count_index],
                 self.timed_seconds_options[self.timed_seconds_index],
+                self.word_list_options[self.word_list_index],
                 self.settings_row_index,
             )
         )
+
+    def _refresh_history_screen(self) -> None:
+        filtered_history = filter_run_history(
+            self.history_records,
+            test_mode_filter=self.history_mode_options[self.history_mode_index],
+            setting_filter=self.history_setting_options[self.history_setting_index][1],
+            word_list_filter=self.history_word_list_options[self.history_word_list_index],
+        )
+        history_summary = summarize_run_history(
+            filtered_history,
+            total_runs=len(self.history_records),
+        )
+        self.query_one("#summary", Static).update(
+            render_history_screen(
+                history_summary,
+                filtered_history[:12],
+                self.history_mode_options[self.history_mode_index],
+                self.history_setting_options[self.history_setting_index][0],
+                self.history_word_list_options[self.history_word_list_index],
+                self.history_filter_row_index,
+            )
+        )
+
+    def _get_word_count_personal_best(self) -> float | None:
+        return get_personal_best(
+            "words",
+            self.settings.word_count,
+            self.settings.word_list_name,
+        )
+
+    def _get_timed_personal_best(self) -> float | None:
+        return get_personal_best(
+            "timed",
+            self.settings.timed_seconds,
+            self.settings.word_list_name,
+        )
+
+    def _current_setting_value(self) -> int:
+        if self.test_mode == "timed":
+            return self.settings.timed_seconds
+        return self.settings.word_count
 
     def _timed_test_expired(self) -> bool:
         return self.timed_deadline is not None and time.perf_counter() >= self.timed_deadline
@@ -436,6 +707,38 @@ class TerminalTyperApp(App):
             start_time=self.start_time,
             end_time=self.end_time,
         )
+        if not self.run_recorded:
+            record_run(
+                self.test_mode,
+                self._current_setting_value(),
+                self.settings.word_list_name,
+                self.result.elapsed_time,
+                self.result.wpm,
+                self.result.correct_wpm,
+                self.result.accuracy,
+                self.result.is_match,
+                self.result.user_input,
+                self.prompt_text,
+                self.result.correct_characters,
+                self.result.incorrect_characters,
+                self.result.extra_characters,
+                self.result.missed_characters,
+            )
+            self.run_recorded = True
+        self.best_update_eligible = self.test_mode == "timed" or self.result.is_match
+        self.is_new_personal_best = False
+        self.current_personal_best_wpm = get_personal_best(
+            self.test_mode,
+            self._current_setting_value(),
+            self.settings.word_list_name,
+        )
+        if self.best_update_eligible:
+            self.current_personal_best_wpm, self.is_new_personal_best = record_personal_best(
+                self.test_mode,
+                self._current_setting_value(),
+                self.settings.word_list_name,
+                self.result.wpm,
+            )
         results_label = (
             f"Timed test ({self.settings.timed_seconds} seconds)"
             if self.test_mode == "timed"
@@ -448,5 +751,8 @@ class TerminalTyperApp(App):
                 self.menu_index,
                 show_match_status=self.test_mode != "timed",
                 results_label=results_label,
+                personal_best_wpm=self.current_personal_best_wpm,
+                is_new_personal_best=self.is_new_personal_best,
+                best_update_eligible=self.best_update_eligible,
             )
         )
