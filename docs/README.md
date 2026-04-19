@@ -18,7 +18,7 @@ TerminalTyper is a Textual-based typing test for the terminal. It supports fixed
 
 ## Installation
 
-From the repository root:
+Clone the repository, open a terminal, and change into the project directory. From the repository root, create a virtual environment, activate it, and install the package in editable mode:
 
 ```bash
 python -m venv .venv
@@ -26,7 +26,9 @@ python -m venv .venv
 pip install -e .
 ```
 
-This installs the `terminal-typer` console command.
+If you are not already in the project directory, the commands above will fail because they expect to run next to `pyproject.toml`.
+
+After installation, the `terminal-typer` console command will be available inside that virtual environment.
 
 ## Running
 
